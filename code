@@ -1,0 +1,202 @@
+#include <Camera.h> // カメラ操作用ライブラリ
+#include <DNNRT.h> // ニューラルネットワーク推論エンジン
+#include <SPI.h> // 必須: SDカードモジュールの通信に必要
+#include <Audio.h>
+#include <SDHCI.h> // SDカード操作用ライブラリ
+SDClass theSD;
+#define BAUDRATE 115200 // シリアル通信のボーレート
+#define SD_CS_PIN 10 // SDカードのチップセレクトピン（環境に合わせて設定）
+
+DNNRT dnnrt; // 推論エンジンのインスタンス
+DNNVariable input(28 * 28); // 入力画像データ用変数
+int resultindex = 0; // グローバル変数として初期化
+// オーディオ関連の設定
+AudioClass *theAudio;
+File myFile;
+bool isPlaying = false;
+int currentTrack = 0; // 現在のトラック番号 (0, 1, 2)
+
+// LED関連の設定
+const int ledPins[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}; // LEDが接続されているピン
+const int numLeds = 11; // LEDの数
+int currentLed = 0; // 現在点灯するLEDのインデックス
+
+/* オーディオエラーコールバック関数 */
+static void audio_attention_cb(const ErrorAttentionParam *atprm) {
+Serial.println("Attention!");
+}
+
+/* 再生関数 */
+void playMusic(const char *filePath) {
+if (isPlaying) {
+stopMusic();
+}
+
+myFile = theSD.open(filePath);
+if (!myFile) {
+Serial.printf("MP3ファイルが開けませんでした: %s\n", filePath);
+return;
+}
+
+Serial.printf("MP3ファイルを開きました: %s\n", filePath);
+
+err_t err = theAudio->initPlayer(
+AudioClass::Player0, AS_CODECTYPE_MP3, "/mnt/sd0/BIN",
+AS_SAMPLINGRATE_AUTO, AS_CHANNEL_STEREO
+);
+if (err != AUDIOLIB_ECODE_OK) {
+Serial.println("Player0の初期化に失敗しました");
+myFile.close();
+return;
+}
+
+err = theAudio->writeFrames(AudioClass::Player0, myFile);
+if (err != AUDIOLIB_ECODE_OK && err != AUDIOLIB_ECODE_FILEEND) {
+Serial.printf("ファイル読み取りエラー: %d\n", err);
+myFile.close();
+return;
+}
+
+theAudio->setVolume(70); // 最大音量
+theAudio->startPlayer(AudioClass::Player0);
+isPlaying = true;
+}
+
+/* 再生停止関数 */
+void stopMusic() {
+if (isPlaying) {
+theAudio->stopPlayer(AudioClass::Player0);
+myFile.close();
+isPlaying = false;
+}
+}
+
+/* LED点灯とMP3再生を行う関数 */
+void lightLedAndPlayMusic() {
+// MP3再生
+if (currentTrack == 0) playMusic("/mnt/sd0/0.mp3");
+else if (currentTrack == 1) playMusic("/mnt/sd0/1.mp3");
+else if (currentTrack == 2) playMusic("/mnt/sd0/2.mp3");
+else if (currentTrack == 3) playMusic("/mnt/sd0/3.mp3");
+else if (currentTrack == 4) playMusic("/mnt/sd0/4.mp3");
+else if (currentTrack == 5) playMusic("/mnt/sd0/5.mp3");
+else if (currentTrack == 6) playMusic("/mnt/sd0/6.mp3");
+else if (currentTrack == 7) playMusic("/mnt/sd0/7.mp3");
+else if (currentTrack == 8) playMusic("/mnt/sd0/8.mp3");
+else if (currentTrack == 9) playMusic("/mnt/sd0/9.mp3");
+else if (currentTrack == 10)playMusic("/mnt/sd0/10.mp3");
+currentTrack += 1;//// 次のトラックに移動
+if (currentTrack > 10) {
+currentTrack = 0; //
+}
+// LED点灯
+if (currentLed < 11) {
+digitalWrite(ledPins[currentLed], HIGH); // 現在のLEDを点灯
+currentLed++; // 次のLEDに進む
+}
+// currentLed が 11 の場合に消灯処理を実行
+if (currentLed == 11) {
+playMusic("/mnt/sd0/11.mp3"); //レベルアップ音
+delay(4000); // 4秒待機
+for (int i = 0; i < numLeds; i++) {
+digitalWrite(ledPins[i], LOW); // 全LEDを消灯
+}
+currentLed = 0; // LEDインデックスをリセット
+}
+}
+
+// カメラのコールバック関数（画像を受信時に呼び出される）
+
+void CamCB(CamImage img) {
+if (!img.isAvailable()) return; // 画像が利用可能でない場合は終了
+Serial.println("Start clip and resize");
+
+// 画像を切り出してリサイズ
+CamImage small;
+CamErr camErr = img.clipAndResizeImageByHW(small, 48, 8, 271, 231, 28, 28);
+if (!small.isAvailable()) {
+Serial.println("Error: Failed to create resized image");
+if (camErr) Serial.println("CamErr: " + String(camErr));
+return;
+}
+small.convertPixFormat(CAM_IMAGE_PIX_FMT_RGB565);
+// 画像データをDNN入力形式に変換
+uint16_t* buf = (uint16_t*)small.getImgBuff(); // 画像バッファ
+float* input_buffer = input.data(); // DNN入力用バッファ
+for (int i = 0; i < 28 * 28; ++i, ++buf) {
+input_buffer[i] = (float)(((*buf & 0x07E0) >> 5) << 2); // 緑成分を抽出
+}
+// ニューラルネットワークの推論を実行
+Serial.println("DNN forward");
+dnnrt.inputVariable(input, 0);
+dnnrt.forward();
+DNNVariable output = dnnrt.outputVariable(0);
+
+// 推論結果を取得
+float max_value = 0.0;
+for (int i = 0; i < output.size(); ++i) {
+if (output[i] > max_value) {
+max_value = output[i];
+resultindex = i;
+}
+}
+
+// 推論結果をシリアルモニタに出力
+Serial.print("Result : ");
+Serial.println(resultindex);
+
+}
+
+void setup() {
+// シリアル通信を開始
+Serial.begin(BAUDRATE);
+Serial.begin(115200);
+Serial.println("Starting setup...");
+// LEDピンの初期化
+for (int i = 0; i < numLeds; i++) {
+pinMode(ledPins[i], OUTPUT);
+digitalWrite(ledPins[i], LOW); // 全LEDを消灯
+}
+// SDカードの初期化
+while (!theSD.begin()) {
+Serial.println("SDカードを挿入してください...");
+delay(1000);
+}
+Serial.println("SDカードが認識されました。");
+// オーディオ初期化
+theAudio = AudioClass::getInstance();
+theAudio->begin(audio_attention_cb);
+theAudio->setRenderingClockMode(AS_CLKMODE_NORMAL);
+theAudio->setPlayerMode(AS_SETPLAYER_OUTPUTDEVICE_SPHP, AS_SP_DRV_MODE_1DRIVER);
+Serial.println("オーディオ初期化完了。");
+
+
+// ニューラルネットワークモデルをSDカードから読み込む
+Serial.println("Loading network model");
+File nnbfile = theSD.open("model.nnb", FILE_READ);
+if (!nnbfile) {
+Serial.println("Error: model.nnb not found on SD card");
+while (1);
+
+}
+// 推論エンジンを初期化
+Serial.println("Initialize DNNRT");
+int ret = dnnrt.begin(nnbfile);
+if (ret < 0) {
+Serial.println("Error: DNNRT initialization failed");
+while (1);
+}
+theCamera.begin();
+theCamera.startStreaming(true, CamCB);
+}
+
+void loop() {
+if (resultindex == 1) {
+Serial.println("カメラ停止");
+theCamera.startStreaming(false, CamCB);
+lightLedAndPlayMusic(); // LED点灯とMP3再生を同時に行う
+resultindex = 0; // グローバル変数として初期化
+delay(3000);
+theCamera.startStreaming(true, CamCB);
+}
+}
